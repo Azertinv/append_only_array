@@ -15,6 +15,7 @@ pub enum AppendArrayError {
     ArrayFull,
 }
 
+#[derive(Debug)]
 pub struct AppendArray<T, const N: usize> {
     ticket: AtomicUsize,
     len: AtomicUsize,
@@ -47,17 +48,35 @@ impl<T, const N: usize> Default for AppendArray<T, N> {
 
 impl<T, const N: usize> AppendArray<T, N> {
     /// Append an element to the back of the array, returns the index of the 
-    /// element
+    /// element or an error if the array is full.
     pub fn append(&self, item: T) -> Result<usize, AppendArrayError> {
+        // Get the current ticket and increase it
         let ticket = self.ticket.fetch_add(1, Ordering::Relaxed);
+
+        // If the ticket is too big it means the array is full
         if ticket >= N {
             self.ticket.fetch_sub(1, Ordering::Relaxed);
             return Err(AppendArrayError::ArrayFull);
         }
+
+        // Store the item in the array
         unsafe {
             UnsafeCell::raw_get(self.array[ticket].as_ptr()).write(item);
         }
-        Ok(self.len.fetch_add(1, Ordering::Relaxed))
+
+        // Another thread may have been able to write the next item in the array
+        // before this one and try to increase the length, which could make the
+        // the array use an uninitialized value in the array.
+        // Therefore we need to wait for or turn.
+        while self.len.load(Ordering::Relaxed) != ticket {
+            core::hint::spin_loop();
+        }
+
+        // The item is in the array and it's now our turn to increase the length
+        self.len.fetch_add(1, Ordering::Relaxed);
+
+        // Return the index of the item we just inserted
+        Ok(ticket)
     }
 }
 
@@ -68,28 +87,43 @@ mod tests {
     #[test]
     fn it_works() {
         let array = AppendArray::<u32, 1024>::default();
-        let idx = array.append(31).unwrap();
-        assert_eq!(array[idx], 31);
-        assert_eq!(idx, 0);
+        let idx_0 = array.append(31).unwrap();
+        let idx_1 = array.append(35).unwrap();
+        assert_eq!(array[idx_0], 31);
+        assert_eq!(idx_0, 0);
+        assert_eq!(array[idx_1], 35);
+        assert_eq!(idx_1, 1);
+        assert_eq!(array.len(), 2);
     }
 
     #[test]
     fn stress() {
-        const ITERS: usize = 1024;
+        const ITERS: usize = 0x1_000;
         const THREADS: usize = 8;
         const TOTAL: usize = ITERS * THREADS;
-        let array = AppendArray::<u8, TOTAL>::default();
+        // put the array in a box to not blow up our stack
+        let array = Box::new(AppendArray::<usize, TOTAL>::default());
         std::thread::scope(|s| {
             let array = &array;
             for i in 0..THREADS {
                 s.spawn(move || {
                     for j in 0..ITERS {
-                        array.append((i * j) as u8).unwrap();
+                        array.append(i*ITERS + j).unwrap();
                     }
                 });
             }
         });
         assert_eq!(array.len(), TOTAL);
         assert_eq!(array.append(0), Err(AppendArrayError::ArrayFull));
+        for i in 0..TOTAL {
+            assert!(array.contains(&i));
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn oob() {
+        let array = AppendArray::<&u32, 1024>::default();
+        println!("{:?}", &array[0]);
     }
 }
