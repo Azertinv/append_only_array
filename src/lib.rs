@@ -59,7 +59,7 @@ impl<T, const N: usize> Drop for AppendArray<T, N> {
 }
 
 impl<T, const N: usize> AppendArray<T, N> {
-    /// Append an element to the back of the array, returns the index of the
+    /// Append an element to the end of the array, returns the index of the
     /// element or an error if the array is full.
     pub fn append(&self, item: T) -> Result<usize, AppendArrayError> {
         // Get the current ticket and increase it
