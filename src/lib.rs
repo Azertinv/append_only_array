@@ -1,14 +1,15 @@
+#![no_std]
 #![feature(maybe_uninit_uninit_array)]
 //! A Thread safe append only array with a fixed size. Allows reader's to read
 //! from the array with no atomic operations.
 
-use core::mem::MaybeUninit;
 use core::cell::UnsafeCell;
-use core::result::Result;
 use core::default::Default;
-use core::sync::atomic::Ordering;
-use std::ops::Deref;
-use std::sync::atomic::AtomicUsize;
+use core::fmt::Debug;
+use core::mem::MaybeUninit;
+use core::ops::{Deref, Drop};
+use core::result::Result;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, PartialEq)]
 pub enum AppendArrayError {
@@ -31,7 +32,8 @@ impl<T, const N: usize> Deref for AppendArray<T, N> {
         unsafe {
             core::slice::from_raw_parts(
                 self.array.as_ptr() as *const T,
-                self.len.load(Ordering::Relaxed))
+                self.len.load(Ordering::Relaxed),
+            )
         }
     }
 }
@@ -46,8 +48,18 @@ impl<T, const N: usize> Default for AppendArray<T, N> {
     }
 }
 
+impl<T, const N: usize> Drop for AppendArray<T, N> {
+    fn drop(&mut self) {
+        for i in 0..self.len.load(Ordering::Relaxed) {
+            unsafe {
+                self.array[i].assume_init_drop();
+            }
+        }
+    }
+}
+
 impl<T, const N: usize> AppendArray<T, N> {
-    /// Append an element to the back of the array, returns the index of the 
+    /// Append an element to the back of the array, returns the index of the
     /// element or an error if the array is full.
     pub fn append(&self, item: T) -> Result<usize, AppendArrayError> {
         // Get the current ticket and increase it
@@ -67,7 +79,7 @@ impl<T, const N: usize> AppendArray<T, N> {
         // Another thread may have been able to write the next item in the array
         // before this one and try to increase the length, which could make the
         // the array use an uninitialized value in the array.
-        // Therefore we need to wait for or turn.
+        // Therefore we need to wait for our turn.
         while self.len.load(Ordering::Relaxed) != ticket {
             core::hint::spin_loop();
         }
@@ -81,8 +93,14 @@ impl<T, const N: usize> AppendArray<T, N> {
 }
 
 #[cfg(test)]
+#[macro_use]
+extern crate std;
+
+#[cfg(test)]
 mod tests {
+
     use super::*;
+    use std::boxed::Box;
 
     #[test]
     fn it_works() {
@@ -108,7 +126,7 @@ mod tests {
             for i in 0..THREADS {
                 s.spawn(move || {
                     for j in 0..ITERS {
-                        array.append(i*ITERS + j).unwrap();
+                        array.append(i * ITERS + j).unwrap();
                     }
                 });
             }
@@ -125,5 +143,25 @@ mod tests {
     fn oob() {
         let array = AppendArray::<&u32, 1024>::default();
         println!("{:?}", &array[0]);
+    }
+
+    struct ToDrop<'a>(&'a AtomicUsize);
+    impl Drop for ToDrop<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn dropping() -> Result<(), AppendArrayError> {
+        let count = AtomicUsize::new(0);
+        {
+            let array = AppendArray::<ToDrop, 3>::default();
+            array.append(ToDrop(&count))?;
+            array.append(ToDrop(&count))?;
+            array.append(ToDrop(&count))?;
+        }
+        assert_eq!(count.load(Ordering::Relaxed), 3);
+        Ok(())
     }
 }
