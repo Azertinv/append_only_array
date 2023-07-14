@@ -23,8 +23,10 @@ pub struct AppendArray<T, const N: usize> {
     array: [MaybeUninit<UnsafeCell<T>>; N],
 }
 
-unsafe impl<T: Send, const N: usize> Send for AppendArray<T, N> {}
-unsafe impl<T: Send, const N: usize> Sync for AppendArray<T, N> {}
+// We need to bound the item to Send + Sync otherwise we would be able to append
+// stupid stuff like RefCell to the array when it's not safe to do.
+unsafe impl<T: Send + Sync, const N: usize> Send for AppendArray<T, N> {}
+unsafe impl<T: Send + Sync, const N: usize> Sync for AppendArray<T, N> {}
 
 impl<T, const N: usize> Deref for AppendArray<T, N> {
     type Target = [T];
@@ -32,7 +34,7 @@ impl<T, const N: usize> Deref for AppendArray<T, N> {
         unsafe {
             core::slice::from_raw_parts(
                 self.array.as_ptr() as *const T,
-                self.len.load(Ordering::Relaxed),
+                self.len.load(Ordering::Acquire),
             )
         }
     }
@@ -76,16 +78,15 @@ impl<T, const N: usize> AppendArray<T, N> {
             UnsafeCell::raw_get(self.array[ticket].as_ptr()).write(item);
         }
 
-        // Another thread may have been able to write the next item in the array
-        // before this one and try to increase the length, which could make the
-        // the array use an uninitialized value in the array.
-        // Therefore we need to wait for our turn.
+        // Another thread may not be done writing its item, we need to wait for
+        // it to increase the length of the array before we do, otherwise a
+        // reader could read an uninitialized value from the array.
         while self.len.load(Ordering::Relaxed) != ticket {
             core::hint::spin_loop();
         }
 
         // The item is in the array and it's now our turn to increase the length
-        self.len.fetch_add(1, Ordering::Relaxed);
+        self.len.fetch_add(1, Ordering::Release);
 
         // Return the index of the item we just inserted
         Ok(ticket)
@@ -99,8 +100,11 @@ extern crate std;
 #[cfg(test)]
 mod tests {
 
+
     use super::*;
+    use std::vec::Vec;
     use std::boxed::Box;
+    use std::hint::black_box;
 
     #[test]
     fn it_works() {
@@ -116,7 +120,10 @@ mod tests {
 
     #[test]
     fn stress() {
+        #[cfg(not(miri))]
         const ITERS: usize = 0x1_000;
+        #[cfg(miri)]
+        const ITERS: usize = 0x10;
         const THREADS: usize = 8;
         const TOTAL: usize = ITERS * THREADS;
         // put the array in a box to not blow up our stack
@@ -129,6 +136,11 @@ mod tests {
                         array.append(i * ITERS + j).unwrap();
                     }
                 });
+                s.spawn(move || {
+                    for _ in 0..ITERS {
+                        black_box(array.last());
+                    }
+                });
             }
         });
         assert_eq!(array.len(), TOTAL);
@@ -136,6 +148,66 @@ mod tests {
         for i in 0..TOTAL {
             assert!(array.contains(&i));
         }
+    }
+
+    #[test]
+    fn stress_2() {
+        #[cfg(not(miri))]
+        const ITERS: usize = 0x100;
+        #[cfg(miri)]
+        const ITERS: usize = 0x10;
+        const THREADS: usize = 8;
+        const TOTAL: usize = ITERS * THREADS;
+        enum Data {
+            Ayy(Vec<u8>),
+            Lmao([u8; 0x100]),
+        }
+        // put the array in a box to not blow up our stack
+        let array = Box::new(AppendArray::<Data, TOTAL>::default());
+        std::thread::scope(|s| {
+            let array = &array;
+            for i in 0..THREADS {
+                s.spawn(move || {
+                    if i % 2 == 0 {
+                        for _ in 0..ITERS {
+                            array.append(Data::Ayy(vec![5])).unwrap();
+                        }
+                    } else {
+                        for _ in 0..ITERS {
+                            array.append(Data::Lmao([0; 0x100])).unwrap();
+                        }
+                    }
+                });
+                s.spawn(move || {
+                    for _ in 0..ITERS {
+                        black_box(array.last());
+                    }
+                });
+            }
+        });
+        assert_eq!(array.len(), TOTAL);
+    }
+
+    #[test]
+    fn stress_3() {
+        #[cfg(not(miri))]
+        const ITERS: usize = 0x1_000;
+        #[cfg(miri)]
+        const ITERS: usize = 0x100;
+        const THREADS: usize = 8;
+        let array = AppendArray::<u32, 1>::default();
+        array.append(1).unwrap();
+        std::thread::scope(|s| {
+            let array = &array;
+            for _ in 0..THREADS {
+                s.spawn(move || {
+                    for _ in 0..ITERS {
+                        let _ = array.append(2);
+                    }
+                });
+            }
+        });
+        assert_eq!(array[..], [1]);
     }
 
     #[test]
@@ -164,4 +236,20 @@ mod tests {
         assert_eq!(count.load(Ordering::Relaxed), 3);
         Ok(())
     }
+
+    // use core::cell::RefCell;
+    // #[test]
+    // fn mutability() -> Result<(), AppendArrayError> {
+    //     let array = AppendArray::<RefCell<u32>, 1024>::default();
+    //     array.append(RefCell::new(1))?;
+    //     std::thread::scope(|s| {
+    //         s.spawn(|| {
+    //             println!("{:?}", array[0]);
+    //         });
+    //         s.spawn(|| {
+    //             println!("{:?}", array[0]);
+    //         });
+    //     });
+    //     Ok(())
+    // }
 }
