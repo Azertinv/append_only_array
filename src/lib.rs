@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(maybe_uninit_uninit_array)]
 //! A Thread safe append only array with a fixed size. Allows reader's to read
 //! from the array with no atomic operations.
 
@@ -45,14 +44,14 @@ impl<T, const N: usize> Default for AppendArray<T, N> {
         AppendArray {
             ticket: AtomicUsize::new(0),
             len: AtomicUsize::new(0),
-            array: MaybeUninit::uninit_array(),
+            array: unsafe { MaybeUninit::uninit().assume_init() },
         }
     }
 }
 
 impl<T, const N: usize> Drop for AppendArray<T, N> {
     fn drop(&mut self) {
-        for i in 0..self.len.load(Ordering::Relaxed) {
+        for i in 0..*self.len.get_mut() {
             unsafe {
                 self.array[i].assume_init_drop();
             }
@@ -77,6 +76,10 @@ impl<T, const N: usize> AppendArray<T, N> {
         unsafe {
             UnsafeCell::raw_get(self.array[ticket].as_ptr()).write(item);
         }
+
+        // Add a random pause here during stress testing to exacerbate issues.
+        #[cfg(test)]
+        tests::random_pause(0x10);
 
         // Another thread may not be done writing its item, we need to wait for
         // it to increase the length of the array before we do, otherwise a
@@ -103,6 +106,20 @@ mod tests {
     use std::boxed::Box;
     use std::hint::black_box;
     use std::vec::Vec;
+
+    pub(crate) fn random_pause(bound: u64) {
+        use core::sync::atomic::AtomicU64;
+
+        static STATE: AtomicU64 = AtomicU64::new(0x12345789abcdef);
+        let mut state = STATE.load(Ordering::Acquire);
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        STATE.store(state, Ordering::Release);
+        for _ in 0..(state % bound) {
+            core::hint::spin_loop();
+        }
+    }
 
     #[test]
     fn it_works() {
@@ -151,7 +168,7 @@ mod tests {
     #[test]
     fn stress_2() {
         #[cfg(not(miri))]
-        const ITERS: usize = 0x100;
+        const ITERS: usize = 0x80;
         #[cfg(miri)]
         const ITERS: usize = 0x10;
         const THREADS: usize = 8;
