@@ -99,12 +99,10 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
-
-
     use super::*;
-    use std::vec::Vec;
     use std::boxed::Box;
     use std::hint::black_box;
+    use std::vec::Vec;
 
     #[test]
     fn it_works() {
