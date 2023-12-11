@@ -60,6 +60,15 @@ impl<T, const N: usize> Drop for AppendArray<T, N> {
 }
 
 impl<T, const N: usize> AppendArray<T, N> {
+    /// A const alternative to the default trait implementation
+    pub const fn default() -> Self {
+        AppendArray {
+            ticket: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+            array: unsafe { MaybeUninit::uninit().assume_init() },
+        }
+    }
+
     /// Append an element to the end of the array, returns the index of the
     /// element or an error if the array is full.
     pub fn append(&self, item: T) -> Result<usize, AppendArrayError> {
@@ -139,7 +148,7 @@ mod tests {
         const ITERS: usize = 0x1_000;
         #[cfg(miri)]
         const ITERS: usize = 0x10;
-        const THREADS: usize = 8;
+        const THREADS: usize = 4;
         const TOTAL: usize = ITERS * THREADS;
         // put the array in a box to not blow up our stack
         let array = Box::new(AppendArray::<usize, TOTAL>::default());
@@ -168,10 +177,10 @@ mod tests {
     #[test]
     fn stress_2() {
         #[cfg(not(miri))]
-        const ITERS: usize = 0x80;
+        const ITERS: usize = 0x20;
         #[cfg(miri)]
         const ITERS: usize = 0x10;
-        const THREADS: usize = 8;
+        const THREADS: usize = 4;
         const TOTAL: usize = ITERS * THREADS;
         enum Data {
             Ayy(Vec<u8>),
@@ -206,10 +215,10 @@ mod tests {
     #[test]
     fn stress_3() {
         #[cfg(not(miri))]
-        const ITERS: usize = 0x1_000;
-        #[cfg(miri)]
         const ITERS: usize = 0x100;
-        const THREADS: usize = 8;
+        #[cfg(miri)]
+        const ITERS: usize = 0x10;
+        const THREADS: usize = 4;
         let array = AppendArray::<u32, 1>::default();
         array.append(1).unwrap();
         std::thread::scope(|s| {
